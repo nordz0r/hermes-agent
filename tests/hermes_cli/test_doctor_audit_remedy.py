@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 
 from hermes_cli import doctor_tools
+from hermes_cli.doctor_report import Finding
 
 
 def _audit_json(critical=0, high=0, moderate=0):
@@ -44,7 +45,21 @@ def test_root_remedy_never_prescribes_local_audit_fix(capsys):
     assert "run: cd" not in out
     assert "npm audit fix" not in out
     assert "lockfile bump" in out
-    assert issues == ["Browser tools (agent-browser) has 2 npm vulnerabilities"]
+    assert issues == [
+        "Browser tools (agent-browser) has 2 npm vulnerabilities; wait for an upstream lockfile fix, then update "
+        "your installation (Docker: pull a rebuilt image)"
+    ]
+
+
+def test_npm_audit_only_finding_does_not_offer_doctor_fix(capsys):
+    """npm lockfile findings need an upstream image or lockfile update (#136806)."""
+    from hermes_cli import doctor
+
+    doctor._print_summary(False, Finding(manual_issues=["web workspace has 1 npm vulnerability"]))
+
+    out = capsys.readouterr().out
+    assert "web workspace has 1 npm vulnerability" in out
+    assert "hermes doctor --fix" not in out
 
 
 

@@ -414,7 +414,7 @@ def _plural(n: int) -> str:
     return "vulnerability" if n == 1 else "vulnerabilities"
 
 
-def _audit_one(npm_bin: str, npm_dir, label: str, audit_extra: list[str], issues: list[str]) -> None:
+def _audit_one(npm_bin: str, npm_dir, label: str, audit_extra: list[str], manual_issues: list[str]) -> None:
     """Run one `npm audit --json` and report; any failure is silently skipped.
 
     Every row here audits a tree whose versions come from a COMMITTED lockfile
@@ -449,7 +449,10 @@ def _audit_one(npm_bin: str, npm_dir, label: str, audit_extra: list[str], issues
                            "errors with an arborist crash it's a known npm bug — clears via a lockfile bump")
             else:
                 check_info(f"  ^ {detail}; report/pin the fix in package-lock.json — see #116774")
-            issues.append(f"{label} has {total} npm {_plural(total)}")
+            manual_issues.append(
+                f"{label} has {total} npm {_plural(total)}; wait for an upstream lockfile fix, then update "
+                "your installation (Docker: pull a rebuilt image)"
+            )
         else:
             check_ok(f"{label} deps", f"({moderate} moderate {_plural(moderate)})")
     except Exception:
@@ -487,7 +490,7 @@ def _check_npm_audit(should_fix: bool, f: Finding) -> None:
         ):
             # Workspace-scoped audits check the root node_modules; standalone dirs check their own.
             if ((PROJECT_ROOT if audit_extra else npm_dir) / "node_modules").exists():
-                _audit_one(npm_bin, npm_dir, label, audit_extra, f.issues)
+                _audit_one(npm_bin, npm_dir, label, audit_extra, f.manual_issues)
     if _is_termux():
         check_info("Termux compatibility fallbacks:")
         for note in _TERMUX_INSTALL_ALL_FALLBACK_NOTES:
