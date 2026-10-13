@@ -51,7 +51,6 @@ def test_media_refs_are_not_appended_inside_an_unclosed_code_fence(tmp_path):
     assert markdown.rindex("```") < markdown.index("tg://photo?id=media_0"), markdown
 
 
-@pytest.mark.xfail(strict=True, reason="gap: position (fixed later in this PR)")
 def test_standalone_image_line_keeps_its_position_in_rich_message():
     adapter = _adapter()
     content = "| a | b |\n|---|---|\n| 1 | 2 |\n\n![chart](https://example.com/c.png)\n\nOutro"
@@ -120,3 +119,24 @@ async def test_ambiguous_timeout_is_logged_as_dropped_delivery(tmp_path, caplog)
 
     assert result is not None and result.success is False
     assert "response_delivery_dropped" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_kept_inline_image_goes_native_when_rich_is_rejected():
+    from telegram.error import BadRequest
+
+    adapter = _adapter()
+    adapter._bot.do_api_request = AsyncMock(side_effect=BadRequest("can't parse"))
+    adapter.send_image = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="9")
+    )
+
+    result = await adapter.send(
+        "12345", "| a |\n|---|\n| 1 |\n\n![](https://example.com/c.png)\n\nOutro"
+    )
+
+    assert result.success
+    sent_text = adapter._bot.send_message.await_args.kwargs["text"]
+    assert "example.com" not in sent_text
+    adapter.send_image.assert_awaited_once()
+    assert adapter.send_image.await_args.args[1] == "https://example.com/c.png"

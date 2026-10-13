@@ -16,6 +16,7 @@ import logging
 import os
 import html as _html
 import re
+import secrets
 import threading
 import time
 from contextvars import ContextVar
@@ -486,6 +487,64 @@ def _rich_is_pre_send_error(exc: BaseException) -> bool:
             return True
         current = current.__cause__ or current.__context__
     return False
+
+
+# ``rich_inline_media``: a standalone ``![alt](https://...)`` line stays in
+# place as a rich media block instead of being extracted into a detached
+# photo. Mirrors the image set of BasePlatformAdapter.extract_images.
+_RICH_MEDIA_LINE_RE = re.compile(r"^[ ]{0,3}!\[[^\]\n]*\]\((https://[^\s)]+)\)[ \t]*$")
+_RICH_MEDIA_EXT_RE = re.compile(r"(?i)\.(?:gif|png|jpe?g|webp)$")
+
+
+def _rich_iter_lines(text: str):
+    """Yield ``(line, media_url_or_None)``; lines in fenced code are never media."""
+    fence: Optional[str] = None
+    for line in text.split("\n"):
+        if fence is not None:
+            close = _RICH_FENCE_CLOSE_RE.match(line)
+            if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= len(fence):
+                fence = None
+            yield line, None
+            continue
+        opening = _RICH_FENCE_RE.match(line)
+        if opening:
+            fence = opening.group(1)
+            yield line, None
+            continue
+        match = _RICH_MEDIA_LINE_RE.match(line)
+        url = match.group(1) if match else None
+        if url and not _RICH_MEDIA_EXT_RE.search(url.split("?", 1)[0]):
+            url = None
+        yield line, url
+
+
+def _rich_standalone_media_urls(text: str) -> List[str]:
+    """HTTPS image URLs that sit alone on a line outside fenced code."""
+    return [url for _, url in _rich_iter_lines(text or "") if url]
+
+
+def _rich_separate_media_blocks(text: str) -> str:
+    """Surround each standalone media line with blank lines (own rich block)."""
+    if not text or "![" not in text:
+        return text
+    lines = list(_rich_iter_lines(text))
+    out: List[str] = []
+    for index, (line, url) in enumerate(lines):
+        if not url:
+            out.append(line)
+            continue
+        if out and out[-1].strip():
+            out.append("")
+        out.append(line.strip())
+        if index + 1 < len(lines) and lines[index + 1][0].strip():
+            out.append("")
+    return "\n".join(out)
+
+
+def _rich_strip_standalone_media(text: str) -> str:
+    """Drop standalone media lines (legacy path sends them as attachments)."""
+    kept = [line for line, url in _rich_iter_lines(text or "") if not url]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
 
 
 def _rich_normalize_linebreaks(text: str) -> str:
@@ -1738,6 +1797,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not content:
             return False
+        if self._rich_inline_media_active() and _rich_standalone_media_urls(content):
+            return True
         if any(_TABLE_SEPARATOR_RE.match(line) for line in content.splitlines()):
             return True
         if re.search(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+", content):
@@ -1747,6 +1808,87 @@ class TelegramAdapter(BasePlatformAdapter):
         if "$$" in content:
             return True
         return False
+
+    def _rich_inline_media_active(self) -> bool:
+        """``rich_inline_media`` opt-in AND a usable rich transport."""
+        return bool(
+            getattr(self, "_rich_inline_media_enabled", False)
+            and self._rich_delivery_enabled()
+            and not getattr(self, "_rich_send_disabled", False)
+            and self._bot_supports_rich()
+        )
+
+    def extract_images(self, content: str) -> tuple[List[tuple[str, str]], str]:
+        """Base extraction, but standalone image lines stay in place when the
+        reply will ride a rich message (``rich_inline_media``).
+
+        Shadows the base staticmethod on instances only; callers use
+        ``adapter.extract_images``.
+        """
+        base = BasePlatformAdapter.extract_images
+        if not (
+            content
+            and self._rich_inline_media_active()
+            and _rich_standalone_media_urls(content)
+            and self._rich_eligible(content)
+        ):
+            return base(content)
+        nonce = secrets.token_hex(8)
+        while nonce in content:
+            nonce = secrets.token_hex(8)
+        placeholders: Dict[str, str] = {}
+        kept: List[str] = []
+        for line, url in _rich_iter_lines(content):
+            if url:
+                key = f"\x00RICHMEDIA{nonce}:{len(placeholders)}\x00"
+                placeholders[key] = line
+                kept.append(key)
+            else:
+                kept.append(line)
+        images, cleaned = base("\n".join(kept))
+        for key, line in placeholders.items():
+            cleaned = cleaned.replace(key, line)
+        return images, cleaned
+
+    async def _send_with_standalone_media_fallback(
+        self,
+        chat_id: str,
+        content: str,
+        urls: List[str],
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Legacy path for kept-inline image lines: text first, then each
+        image as a native attachment. Partial delivery is never retryable."""
+        text = _rich_strip_standalone_media(content)
+        result = (
+            await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+            if text
+            else SendResult(success=True, message_id=None)
+        )
+        if not result.success and result.message_id is None:
+            return result
+        failure: Optional[SendResult] = None
+        first_media: Optional[SendResult] = None
+        for url in urls:
+            sender = self.send_animation if self._is_animation_url(url) else self.send_image
+            media = await sender(chat_id, url, reply_to=reply_to, metadata=metadata)
+            if media.success:
+                first_media = first_media or media
+            else:
+                failure = media
+                logger.warning("[%s] inline media fallback failed: %s", self.name, media.error)
+        if failure is not None and result.success:
+            delivered = result.message_id or (first_media.message_id if first_media else None)
+            return SendResult(
+                success=False,
+                message_id=delivered,
+                error=failure.error or "inline_media_failed",
+                retryable=delivered is None and bool(failure.retryable),
+            )
+        if result.message_id is None and first_media is not None:
+            return first_media
+        return result
 
     def _rich_delivery_enabled(self) -> bool:
         """Whether rich delivery is allowed (``rich_messages`` opt-in)."""
@@ -1827,6 +1969,8 @@ class TelegramAdapter(BasePlatformAdapter):
         multi-line content (slash-command lists, etc.) renders correctly
         in the rich-message path.  See ``_rich_normalize_linebreaks``.
         """
+        if getattr(self, "_rich_inline_media_enabled", False):
+            content = _rich_separate_media_blocks(content)
         payload: Dict[str, Any] = {"markdown": _rich_normalize_linebreaks(content)}
         if skip_entity_detection:
             payload["skip_entity_detection"] = True
@@ -4370,6 +4514,17 @@ class TelegramAdapter(BasePlatformAdapter):
                             except Exception:
                                 pass  # Typing failures are non-fatal
                     return rich_result
+
+            # Kept-inline image lines that could not ride a rich message go
+            # out as native attachments instead of raw markdown.
+            if getattr(self, "_rich_inline_media_enabled", False) and not (
+                metadata or {}
+            ).get("expect_edits"):
+                inline_urls = _rich_standalone_media_urls(content)
+                if inline_urls:
+                    return await self._send_with_standalone_media_fallback(
+                        chat_id, content, inline_urls, reply_to, metadata
+                    )
 
             # Format and split message if needed
             formatted = self.format_message(content)
