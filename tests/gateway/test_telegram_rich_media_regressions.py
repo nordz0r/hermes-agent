@@ -90,7 +90,6 @@ async def test_mixed_attachments_embed_supported_media_and_return_the_rest(tmp_p
     assert result.raw_response["unembedded_media"] == [(str(document), False)]
 
 
-@pytest.mark.xfail(strict=True, reason="gap: transient loss (fixed later in this PR)")
 @pytest.mark.asyncio
 async def test_pre_send_network_error_falls_back_to_plain_delivery(tmp_path):
     adapter = _adapter()
@@ -109,7 +108,6 @@ async def test_pre_send_network_error_falls_back_to_plain_delivery(tmp_path):
     assert result is None
 
 
-@pytest.mark.xfail(strict=True, reason="gap: transient loss (fixed later in this PR)")
 @pytest.mark.asyncio
 async def test_ambiguous_timeout_is_logged_as_dropped_delivery(tmp_path, caplog):
     adapter = _adapter()

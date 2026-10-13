@@ -458,6 +458,36 @@ def _rich_close_open_fence(text: str) -> str:
     return f"{text}\n{fence}" if fence else text
 
 
+# Failures raised before the request left this host: Telegram cannot have
+# received it, so the plain text + attachment path is safe (no duplicate).
+_RICH_PRE_SEND_ERROR_NAMES = frozenset(
+    {"ConnectError", "ConnectTimeout", "PoolTimeout", "gaierror", "ConnectionRefusedError"}
+)
+_RICH_PRE_SEND_MESSAGE_MARKERS = (
+    "pool timeout",
+    "httpx.connecterror",
+    "httpx.connecttimeout",
+    "name resolution",
+    "name or service not known",
+    "connection refused",
+)
+
+
+def _rich_is_pre_send_error(exc: BaseException) -> bool:
+    """True when ``exc`` (or its cause chain) is a connect/DNS/pool failure."""
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__name__ in _RICH_PRE_SEND_ERROR_NAMES:
+            return True
+        text = str(current).lower()
+        if any(marker in text for marker in _RICH_PRE_SEND_MESSAGE_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _rich_normalize_linebreaks(text: str) -> str:
     """Convert single ``\\n`` to Markdown hard breaks for the rich-message path.
 
@@ -1896,9 +1926,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return None
             safe_error = _redact_telegram_error_text(exc)
+            if _rich_is_pre_send_error(exc):
+                logger.warning(
+                    "[%s] %s inline-media request not sent (%s) — using plain text + attachments",
+                    self.name, endpoint, safe_error,
+                )
+                return None
+            # The request may have reached Telegram: no resend (duplicate risk),
+            # but never lose the reply silently.
             logger.warning(
-                "[%s] %s inline-media transient failure (no duplicate fallback): %s",
-                self.name, endpoint, safe_error,
+                "[%s] response_delivery_dropped: %s inline-media outcome unknown "
+                "(%d chars, %d media), not resent to avoid a duplicate: %s",
+                self.name, endpoint, len(content or ""),
+                len(payload.get("rich_message", {}).get("media", [])), safe_error,
             )
             return SendResult(success=False, error=safe_error, retryable=True)
 
