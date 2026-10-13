@@ -43,7 +43,6 @@ def _png(tmp_path, name="chart.png"):
     return path
 
 
-@pytest.mark.xfail(strict=True, reason="gap: fence (fixed later in this PR)")
 def test_media_refs_are_not_appended_inside_an_unclosed_code_fence(tmp_path):
     built = _build(_adapter(), "log:\n```\nline1\nline2", [_png(tmp_path)])
     assert built is not None

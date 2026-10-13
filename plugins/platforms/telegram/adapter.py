@@ -433,6 +433,31 @@ _RICH_PROTECTED_REGION_RE = re.compile(
 )
 
 
+_RICH_FENCE_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})")
+_RICH_FENCE_CLOSE_RE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})[ \t]*$")
+
+
+def _rich_open_fence(text: str) -> Optional[str]:
+    """Return the delimiter of a fenced code block left open at the end of ``text``."""
+    fence: Optional[str] = None
+    for line in text.split("\n"):
+        if fence is not None:
+            close = _RICH_FENCE_CLOSE_RE.match(line)
+            if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= len(fence):
+                fence = None
+            continue
+        opening = _RICH_FENCE_RE.match(line)
+        if opening:
+            fence = opening.group(1)
+    return fence
+
+
+def _rich_close_open_fence(text: str) -> str:
+    """Close a trailing unclosed fence so appended media blocks are not code text."""
+    fence = _rich_open_fence(text)
+    return f"{text}\n{fence}" if fence else text
+
+
 def _rich_normalize_linebreaks(text: str) -> str:
     """Convert single ``\\n`` to Markdown hard breaks for the rich-message path.
 
@@ -1843,7 +1868,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         rich_message = self._rich_message_payload(content)
         rich_message["markdown"] = (
-            rich_message["markdown"].rstrip()
+            _rich_close_open_fence(rich_message["markdown"].rstrip())
             + "\n\n"
             + "\n\n".join(markdown_blocks)
         )
