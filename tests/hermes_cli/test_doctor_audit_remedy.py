@@ -82,7 +82,7 @@ def test_root_audit_row_is_not_mislabeled_as_agent_browser(monkeypatch, tmp_path
     project = tmp_path / "project"
     (project / "node_modules").mkdir(parents=True)
     monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
-    monkeypatch.setattr(doctor_tools, "_safe_which", lambda cmd: "/usr/bin/npm" if cmd == "npm" else None)
+    monkeypatch.setattr(doctor_tools, "_pm_tool_path", lambda name: "/usr/bin/npm" if name == "npm" else None)
     monkeypatch.setattr(whatsapp_common, "resolve_whatsapp_bridge_dir", lambda: tmp_path / "no-whatsapp-bridge")
 
     completed = subprocess.CompletedProcess([], 0, stdout=_audit_json(), stderr="")
