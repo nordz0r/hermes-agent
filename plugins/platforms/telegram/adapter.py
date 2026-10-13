@@ -9,6 +9,7 @@ import logging
 import os
 import html as _html
 import re
+import secrets
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone, UTC
@@ -428,6 +429,65 @@ def _rich_normalize_linebreaks(text: str) -> str:
     return ''.join(out)
 
 
+
+# ``rich_inline_media``: a standalone ``![alt](https://...)`` line becomes an inline media block of the
+# rich message instead of a detached photo. Bot API: media must be its own block (blank lines around it).
+# No title form: matches exactly what BasePlatformAdapter.extract_images extracts, so plain extraction
+# (e.g. ``[[as_document]]``) always covers every line kept inline here.
+_RICH_MEDIA_LINE_RE = re.compile(r'^[ ]{0,3}!\[[^\]\n]*\]\((https://[^\s)]+)\)[ \t]*$')
+_RICH_MEDIA_EXT_RE = re.compile(r'(?i)\.(?:gif|png|jpe?g|webp)$')  # the base extractor's image set
+_RICH_FENCE_RE = re.compile(r'^[ ]{0,3}(`{3,}|~{3,})')
+_RICH_FENCE_CLOSE_RE = re.compile(r'^[ ]{0,3}(`{3,}|~{3,})[ \t]*$')  # closer: delimiter + whitespace only
+
+
+def _rich_iter_lines(text: str):
+    """Yield ``(line, media_url_or_None)``; lines inside fenced code never count as media."""
+    fence: Optional[str] = None
+    for line in text.split('\n'):
+        fm = _RICH_FENCE_RE.match(line)
+        if fence is not None:
+            cm = _RICH_FENCE_CLOSE_RE.match(line)
+            if cm and cm.group(1)[0] == fence[0] and len(cm.group(1)) >= len(fence):
+                fence = None
+            yield line, None
+            continue
+        if fm:
+            fence = fm.group(1)
+            yield line, None
+            continue
+        m = _RICH_MEDIA_LINE_RE.match(line)
+        url = m.group(1) if m and _RICH_MEDIA_EXT_RE.search(m.group(1).split('?', 1)[0]) else None
+        yield line, url
+
+
+def _rich_standalone_media_urls(text: str) -> list[str]:
+    """HTTPS media URLs that sit alone on a line outside fenced code."""
+    return [url for _, url in _rich_iter_lines(text or '') if url]
+
+
+def _rich_separate_media_blocks(text: str) -> str:
+    """Surround each standalone media line with blank lines so it is its own rich block."""
+    if not text or '![' not in text:
+        return text
+    lines = list(_rich_iter_lines(text))
+    out: list[str] = []
+    for idx, (line, url) in enumerate(lines):
+        if not url:
+            out.append(line)
+            continue
+        if out and out[-1].strip():
+            out.append('')
+        out.append(line.strip())
+        if idx + 1 < len(lines) and lines[idx + 1][0].strip():
+            out.append('')
+    return '\n'.join(out)
+
+
+def _rich_strip_standalone_media(text: str) -> str:
+    """Drop standalone media lines (legacy fallback sends them as native attachments)."""
+    kept = [line for line, url in _rich_iter_lines(text or '') if not url]
+    return re.sub(r'\n{3,}', '\n\n', '\n'.join(kept)).strip()
+
 # Internal safety bounds (not user knobs): no reconnect/teardown path may hang on a dead CLOSE-WAIT
 # socket PTB's polling task is blocked on in epoll.
 _UPDATER_STOP_TIMEOUT = 15.0  # `await updater.stop()`, applied identically at every site
@@ -605,6 +665,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         # CJK stays on legacy MarkdownV2 by default (Desktop/macOS garble, #47653); opt-in for unaffected clients.
         self._allow_cjk_rich_messages: bool = self._coerce_bool_extra("allow_cjk_rich_messages", False)
         self._rich_drafts_enabled: bool = self._coerce_bool_extra("rich_drafts", False)
+        # Opt-in: standalone ``![](https://….gif|png|…)`` lines stay inline as rich media blocks instead of
+        # being extracted into separate photo/animation messages (needs rich_messages).
+        self._rich_inline_media_enabled: bool = self._coerce_bool_extra("rich_inline_media", False)
         self._rich_send_disabled = self._rich_draft_disabled = False  # latched after a capability failure
         # Transient sendChatAction failures recur on every keep-typing tick; back off per chat.
         self._telegram_typing_cooldown_until: dict[str, float] = {}
@@ -1329,6 +1392,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         """
         if not content:
             return False
+        if self._rich_inline_media_active() and _rich_standalone_media_urls(content):
+            return True
         if any(_TABLE_SEPARATOR_RE.match(line) for line in content.splitlines()):
             return True
         if re.search(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+", content):
@@ -1336,6 +1401,39 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         if re.search(r"(?m)^<details\b|^</details>|^<summary\b|^</summary>", content):
             return True
         return "$$" in content
+
+    def _rich_inline_media_active(self) -> bool:
+        """``rich_inline_media`` opt-in AND a usable rich transport (else media stays native)."""
+        return bool(getattr(self, "_rich_inline_media_enabled", False) and self._rich_transport_available())
+
+    def extract_images(self, content: str) -> tuple[list[tuple[str, str]], str]:
+        """Base extraction, except standalone media lines stay inline when they will ride a rich message.
+
+        Shadows the base staticmethod on instances only (call sites use ``adapter.extract_images``)."""
+        base = BasePlatformAdapter.extract_images
+        try:
+            if not (content and self._rich_inline_media_active() and _rich_standalone_media_urls(content)
+                    and self._rich_content_ok(content)):
+                return base(content)
+            nonce = secrets.token_hex(8)
+            while nonce in content:
+                nonce = secrets.token_hex(8)
+            placeholders: dict[str, str] = {}
+            kept: list[str] = []
+            for line, url in _rich_iter_lines(content):
+                if url:
+                    key = f"\x00RICHMEDIA{nonce}:{len(placeholders)}\x00"
+                    placeholders[key] = line
+                    kept.append(key)
+                else:
+                    kept.append(line)
+            images, cleaned = base("\n".join(kept))
+            for key, line in placeholders.items():
+                cleaned = cleaned.replace(key, line)
+            return images, cleaned
+        except Exception:
+            logger.debug("[%s] rich inline media extraction failed; using base extraction", self.name, exc_info=True)
+            return base(content)
 
     def _rich_delivery_enabled(self) -> bool:
         """Whether rich delivery is allowed (``rich_messages`` opt-in)."""
@@ -1394,6 +1492,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
     def _rich_message_payload(self, content: str, *, skip_entity_detection: bool = False) -> dict[str, Any]:
         """``InputRichMessage`` from RAW markdown — never ``format_message(content)``, whose MarkdownV2
         escaping destroys table pipes."""
+        if getattr(self, "_rich_inline_media_enabled", False):
+            content = _rich_separate_media_blocks(content)
         payload: dict[str, Any] = {"markdown": _rich_normalize_linebreaks(content)}
         if skip_entity_detection:
             payload["skip_entity_detection"] = True
@@ -3637,11 +3737,51 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         # One chat at a time (held only around the API calls, never across the reconnect wait above), so
         # two concurrent split replies to one chat cannot interleave their chunks (#114396).
+        media_fallback: list[str] = []
         async with self._chat_send_lock(chat_id):
-            return await self._send_text_locked(chat_id, content, reply_to, metadata)
+            result = await self._send_text_locked(chat_id, content, reply_to, metadata, media_fallback=media_fallback)
+        if not media_fallback or (not result.success and result.message_id is None):
+            return result  # nothing landed: a retry of the whole reply re-sends the media too
+        text_failure = None if result.success else result  # partial text: its tail recovery excludes media
+        # Inline media that could not ride a rich message goes out natively, outside the chat lock
+        # (_send_media takes it per call).
+        media_failure: Optional[SendResult] = None
+        media_success: Optional[SendResult] = None
+        all_failures_retryable = True
+        for url in media_fallback:
+            try:
+                if self._is_animation_url(url):
+                    media = await self.send_animation(chat_id, url, reply_to=reply_to, metadata=metadata)
+                else:
+                    media = await self.send_image(chat_id, url, reply_to=reply_to, metadata=metadata)
+            except Exception as exc:
+                media = SendResult(success=False, error=_redact_telegram_error_text(exc))
+            if media.success:
+                media_success = media_success or media
+            else:
+                media_failure = media
+                all_failures_retryable = all_failures_retryable and bool(media.retryable)
+                logger.warning("[%s] inline media fallback failed: %s", self.name, media.error)
+        if text_failure is not None:
+            # Attachments were attempted above; the text tail resumes on its own. A failed attachment cannot
+            # ride that text-only recovery, so it is surfaced in the error rather than silently dropped.
+            if media_failure is not None:
+                text_failure.error = f"{text_failure.error}; inline media failed: {media_failure.error}"
+            return text_failure
+        if media_failure is not None:
+            # Partial delivery is never retryable (a retry would duplicate what landed); a media-only reply
+            # where every attachment certainly failed keeps the attachments' retryability.
+            delivered = result.message_id or (media_success.message_id if media_success else None)
+            retryable = delivered is None and all_failures_retryable
+            return SendResult(success=False, message_id=delivered, error=media_failure.error or "inline_media_failed",
+                              retryable=retryable, retry_after=media_failure.retry_after if retryable else None)
+        if result.message_id is None:
+            return media_success or result  # media-only reply: the attachment is the delivery
+        return result
 
     async def _send_text_locked(
-        self, chat_id: str, content: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]]) -> SendResult:
+        self, chat_id: str, content: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
+        *, media_fallback: Optional[list[str]] = None) -> SendResult:
         """``send()`` body under the per-chat lock: rich fast-path, else MarkdownV2 chunks."""
         # Re-checked under the lock: a burst queued behind a refused send must not each fire once.
         cooldown = self._send_flood_cooldown_remaining(chat_id)
@@ -3671,6 +3811,16 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                     if rich_result.success:
                         await self._retrigger_typing(chat_id, metadata)
                     return rich_result
+            if (media_fallback is not None and getattr(self, "_rich_inline_media_enabled", False)
+                    and not (metadata or {}).get("expect_edits")):
+                # Editable previews keep media as text; native attachments would outlive the preview.
+                # Legacy path: MarkdownV2 cannot embed media, so standalone media lines become attachments.
+                urls = _rich_standalone_media_urls(content)
+                if urls:
+                    media_fallback.extend(urls)
+                    content = _rich_strip_standalone_media(content)
+                    if not content:
+                        return SendResult(success=True, message_id=None)
             chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.

@@ -1104,6 +1104,17 @@ This setting is for client-rendering/copy compatibility; Hermes already falls ba
 
 CJK text (Chinese, Japanese, Korean, and rare Han extensions) stays on the legacy MarkdownV2 path by default because affected Telegram Desktop/macOS clients have rendered Bot API rich messages with overlapping CJK glyph artifacts. If you use an unaffected client and prefer native rich tables/task lists/details/math for CJK payloads, set `allow_cjk_rich_messages: true` alongside `rich_messages: true` to opt in to that client-side risk.
 
+**Inline media in rich messages.** By default, image URLs in a reply (`![alt](https://…/x.png)`) are pulled out of the text and delivered as separate photo/animation messages. With `rich_inline_media: true` (requires `rich_messages: true`), an HTTPS `.gif`, `.png`, `.jpg`/`.jpeg`, or `.webp` image that sits **alone on its own line** (outside code blocks) stays in the reply, which is then sent as a Rich Message with that media embedded as its own block — so a diagram appears inline between the paragraphs that describe it. Images written inline inside a sentence, `<img>` tags, and `MEDIA:` local files are delivered as attachments as before. If rich delivery is unavailable or Telegram rejects the rich message, the text is sent on the legacy path without the media lines and each media URL follows as a native animation or photo, so nothing is lost; if an attachment still fails after the text landed, the send reports a non-retryable failure instead of silently succeeding. Streamed replies keep media lines as text in the live preview, and a final that falls back to a legacy edit shows them as links.
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        rich_messages: true
+        rich_inline_media: true
+```
+
 If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
 
 **Link previews.** Telegram auto-generates link previews for URLs in bot messages. If you'd rather suppress those (long `/tools` output, agent reply that mentions ten links, etc.):
