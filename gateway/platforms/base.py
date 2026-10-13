@@ -4484,7 +4484,10 @@ class BasePlatformAdapter(ABC):
         with self._media_delivery_scope(event.source):
             media_files, response = self.extract_media(response)
             media_files = self.filter_media_delivery_paths(media_files, session_key=session_key)
-            images, text_content = self.extract_images(response)
+            # [[as_document]] forces plain extraction: adapter overrides (Telegram rich inline media) must
+            # not keep an image inline that the user asked to receive as an unmodified document.
+            extract_images = BasePlatformAdapter.extract_images if force_document else self.extract_images
+            images, text_content = extract_images(response)
             # Strip any remaining internal directives from message body (fixes #1561). _strip_media_directives
             # shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag with an unknown extension is intentionally left in
             # the body for extract_local_files below to pick up rather than silently dropped (#34517).
