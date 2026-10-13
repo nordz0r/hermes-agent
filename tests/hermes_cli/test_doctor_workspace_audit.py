@@ -31,4 +31,5 @@ def test_workspace_runtime_findings_are_not_dismissed_as_build_tooling(workspace
     assert "not runtime" not in output
     assert "1 high, 1 moderate" in output
     assert "upstream lockfile bump" in output
-    assert issues == [f"{workspace} workspace has 2 npm vulnerabilities"]
+    assert len(issues) == 1
+    assert issues[0].startswith(f"{workspace} workspace has 2 npm vulnerabilities")

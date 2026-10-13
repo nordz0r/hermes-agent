@@ -47,7 +47,7 @@ def test_root_remedy_never_prescribes_local_audit_fix(capsys):
     assert "lockfile bump" in out
     assert issues == [
         "Browser tools (agent-browser) has 2 npm vulnerabilities; wait for an upstream lockfile fix, then update "
-        "your installation (Docker: pull a rebuilt image)"
+        "your installation (Docker: pull a rebuilt image; recreating the same image restores the same dependencies)"
     ]
 
 
