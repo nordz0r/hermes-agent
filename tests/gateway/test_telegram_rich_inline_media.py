@@ -177,8 +177,7 @@ async def test_media_references_cannot_push_rich_message_past_text_limit(tmp_pat
 
 @pytest.mark.asyncio
 async def test_rich_inline_media_transient_failure_does_not_duplicate_send(tmp_path):
-    class TimedOut(Exception):
-        pass
+    from telegram.error import TimedOut
 
     photo = tmp_path / "chart.png"
     photo.write_bytes(b"png")
