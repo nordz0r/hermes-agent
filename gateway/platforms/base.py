@@ -5088,7 +5088,14 @@ class BasePlatformAdapter(ABC):
                         if rich_media_result is not None:
                             _record_delivery(rich_media_result)
                             text_content = ""
-                            media_files = []
+                            # Contract (Telegram send_rich_media): files it
+                            # could not embed come back for regular delivery.
+                            _rich_raw = rich_media_result.raw_response
+                            media_files = (
+                                list(_rich_raw.get("unembedded_media") or [])
+                                if rich_media_result.success and isinstance(_rich_raw, dict)
+                                else []
+                            )
 
                 # Send the text portion
                 if text_content and not _tts_caption_delivered:

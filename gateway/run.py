@@ -13410,7 +13410,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 adapter.name,
                                 rich_result.error,
                             )
-                        return
+                            return
+                        # Files the adapter could not embed still go out below.
+                        _rich_raw = rich_result.raw_response
+                        media_files = (
+                            list(_rich_raw.get("unembedded_media") or [])
+                            if isinstance(_rich_raw, dict)
+                            else []
+                        )
+                        if not media_files:
+                            return
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}

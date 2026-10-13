@@ -70,7 +70,6 @@ def test_standalone_image_line_is_extracted_when_rich_inline_media_is_off():
     assert "example.com" not in cleaned
 
 
-@pytest.mark.xfail(strict=True, reason="gap: partial embed (fixed later in this PR)")
 @pytest.mark.asyncio
 async def test_mixed_attachments_embed_supported_media_and_return_the_rest(tmp_path):
     photo = _png(tmp_path)

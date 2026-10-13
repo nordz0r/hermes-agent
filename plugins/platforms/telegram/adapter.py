@@ -1998,7 +1998,11 @@ class TelegramAdapter(BasePlatformAdapter):
         media_files: List[tuple],
         stack: Any,
     ) -> Optional[tuple[Dict[str, Any], Dict[str, Any]]]:
-        """Build InputRichMessage.media plus multipart InputFile parameters."""
+        """Build InputRichMessage.media plus multipart InputFile parameters.
+
+        Returns ``(rich_message, uploads, unembedded)``; ``unembedded`` lists
+        the files that must still go out as regular attachments.
+        """
         # Defensive bound: cap simultaneously opened files and multipart parts.
         if not media_files or len(media_files) > 50:
             return None
@@ -2007,7 +2011,8 @@ class TelegramAdapter(BasePlatformAdapter):
         media_entries: List[Dict[str, Any]] = []
         markdown_blocks: List[str] = []
         uploads: Dict[str, Any] = {}
-        for index, item in enumerate(media_files):
+        unembedded: List[tuple] = []
+        for item in media_files:
             try:
                 path, is_voice = item
             except (TypeError, ValueError):
@@ -2015,7 +2020,11 @@ class TelegramAdapter(BasePlatformAdapter):
             path = str(path)
             media_type = self._rich_inline_media_type(path, bool(is_voice))
             if media_type is None or not os.path.isfile(path):
-                return None
+                # Embed what Telegram supports; the rest keeps the regular
+                # attachment path instead of dragging every file with it.
+                unembedded.append(item)
+                continue
+            index = len(media_entries)
             input_type, scheme = media_type
             file_obj = stack.enter_context(open(path, "rb"))
             input_file = InputFile(
@@ -2040,6 +2049,8 @@ class TelegramAdapter(BasePlatformAdapter):
             # Bot API ignores the extra scalar field and resolves attach://.
             uploads[input_file.attach_name] = input_file
 
+        if not media_entries:
+            return None
         rich_message = self._rich_message_payload(content)
         rich_message["markdown"] = (
             _rich_close_open_fence(rich_message["markdown"].rstrip())
@@ -2049,7 +2060,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._content_fits_rich_limits(rich_message["markdown"]):
             return None
         rich_message["media"] = media_entries
-        return rich_message, uploads
+        return rich_message, uploads, unembedded
 
     async def _rich_media_request(
         self,
@@ -2136,7 +2147,7 @@ class TelegramAdapter(BasePlatformAdapter):
             built = self._build_rich_inline_media_payload(content, media_files, stack)
             if built is None:
                 return None
-            rich_message, uploads = built
+            rich_message, uploads, unembedded = built
             payload: Dict[str, Any] = {
                 "chat_id": normalize_telegram_chat_id(chat_id),
                 "rich_message": rich_message,
@@ -2148,7 +2159,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 payload["link_preview_options"] = {"is_disabled": True}
             if reply_to_id is not None:
                 payload["reply_parameters"] = {"message_id": reply_to_id}
-            return await self._rich_media_request("sendRichMessage", payload, content)
+            result = await self._rich_media_request("sendRichMessage", payload, content)
+        return self._with_unembedded_media(result, unembedded)
 
     async def edit_rich_media(
         self,
@@ -2176,7 +2188,7 @@ class TelegramAdapter(BasePlatformAdapter):
             built = self._build_rich_inline_media_payload(content, media_files, stack)
             if built is None:
                 return None
-            rich_message, uploads = built
+            rich_message, uploads, unembedded = built
             payload: Dict[str, Any] = {
                 "chat_id": normalize_telegram_chat_id(chat_id),
                 "message_id": int(message_id),
@@ -2185,7 +2197,22 @@ class TelegramAdapter(BasePlatformAdapter):
             }
             if getattr(self, "_disable_link_previews", False):
                 payload["link_preview_options"] = {"is_disabled": True}
-            return await self._rich_media_request("editMessageText", payload, content)
+            result = await self._rich_media_request("editMessageText", payload, content)
+        return self._with_unembedded_media(result, unembedded)
+
+    @staticmethod
+    def _with_unembedded_media(
+        result: Optional[SendResult], unembedded: List[tuple]
+    ) -> Optional[SendResult]:
+        """Hand files that were not embedded back to the caller.
+
+        Contract: ``raw_response["unembedded_media"]`` lists ``(path, is_voice)``
+        items the caller still sends as regular attachments (base.py rich-media
+        hook, gateway/run.py post-stream upgrade). Only set on success.
+        """
+        if result is not None and result.success and unembedded:
+            result.raw_response = {"unembedded_media": list(unembedded)}
+        return result
 
     def _is_rich_capability_error(self, exc: Exception) -> bool:
         """True ⇒ the rich endpoint itself is unavailable (old PTB/server).
